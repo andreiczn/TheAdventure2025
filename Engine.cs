@@ -1,218 +1,236 @@
-using System.Reflection;
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Text.Json;
 using Silk.NET.Maths;
 using TheAdventure.Models;
 using TheAdventure.Models.Data;
 using TheAdventure.Scripting;
 
-namespace TheAdventure;
-
-public class Engine
+namespace TheAdventure
 {
-    private readonly GameRenderer _renderer;
-    private readonly Input _input;
-    private readonly ScriptEngine _scriptEngine = new();
-
-    private readonly Dictionary<int, GameObject> _gameObjects = new();
-    private readonly Dictionary<string, TileSet> _loadedTileSets = new();
-    private readonly Dictionary<int, Tile> _tileIdMap = new();
-
-    private Level _currentLevel = new();
-    private PlayerObject? _player;
-
-    private DateTimeOffset _lastUpdate = DateTimeOffset.Now;
-
-    public Engine(GameRenderer renderer, Input input)
+    public class Engine
     {
-        _renderer = renderer;
-        _input = input;
+        private readonly GameRenderer _renderer;
+        private readonly Input _input;
+        private readonly ScriptEngine _scriptEngine = new();
 
-        _input.OnMouseClick += (_, coords) => AddBomb(coords.x, coords.y);
-    }
+        // Game Over state
+        private int _gameOverTexId;
+        private TextureData _gameOverData;
+        private bool _isGameOver;
+        private DateTimeOffset _gameOverTimestamp; 
 
-    public void SetupWorld()
-    {
-        _player = new(SpriteSheet.Load(_renderer, "Player.json", "Assets"), 100, 100);
+        private readonly Dictionary<int, GameObject> _gameObjects = new();
+        private readonly Dictionary<string, TileSet>  _loadedTileSets = new();
+        private readonly Dictionary<int, Tile>       _tileIdMap      = new();
 
-        var levelContent = File.ReadAllText(Path.Combine("Assets", "terrain.tmj"));
-        var level = JsonSerializer.Deserialize<Level>(levelContent);
-        if (level == null)
+        private Level _currentLevel = new();
+        private PlayerObject? _player;
+        private DateTimeOffset _lastUpdate = DateTimeOffset.Now;
+
+        public Engine(GameRenderer renderer, Input input)
         {
-            throw new Exception("Failed to load level");
-        }
+            _renderer = renderer;
+            _input    = input;
 
-        foreach (var tileSetRef in level.TileSets)
-        {
-            var tileSetContent = File.ReadAllText(Path.Combine("Assets", tileSetRef.Source));
-            var tileSet = JsonSerializer.Deserialize<TileSet>(tileSetContent);
-            if (tileSet == null)
+            // click → bomb or restart
+            _input.OnMouseClick += (_, coords) =>
             {
-                throw new Exception("Failed to load tile set");
-            }
+                if (_isGameOver) Reset();
+                else             AddBomb(coords.x, coords.y);
+            };
 
-            foreach (var tile in tileSet.Tiles)
+            SetupWorld();
+        }
+
+        public void SetupWorld()
+        {
+            _gameObjects.Clear();
+            _loadedTileSets.Clear();
+            _tileIdMap.Clear();
+            _isGameOver = false;
+
+            _gameOverTexId = _renderer.LoadTexture(
+                Path.Combine("Assets","image.png"),
+                out _gameOverData
+            );
+
+            _player = new(SpriteSheet.Load(_renderer, "Player.json", "Assets"), 100, 100);
+
+            var levelJson = File.ReadAllText(Path.Combine("Assets","terrain.tmj"));
+            _currentLevel = JsonSerializer.Deserialize<Level>(levelJson)
+                            ?? throw new Exception("Failed to load level");
+
+
+            foreach (var tsRef in _currentLevel.TileSets)
             {
-                tile.TextureId = _renderer.LoadTexture(Path.Combine("Assets", tile.Image), out _);
-                _tileIdMap.Add(tile.Id!.Value, tile);
-            }
+                var tsJson = File.ReadAllText(Path.Combine("Assets", tsRef.Source));
+                var tileSet = JsonSerializer.Deserialize<TileSet>(tsJson)
+                              ?? throw new Exception("Failed to load tileset");
 
-            _loadedTileSets.Add(tileSet.Name, tileSet);
-        }
-
-        if (level.Width == null || level.Height == null)
-        {
-            throw new Exception("Invalid level dimensions");
-        }
-
-        if (level.TileWidth == null || level.TileHeight == null)
-        {
-            throw new Exception("Invalid tile dimensions");
-        }
-
-        _renderer.SetWorldBounds(new Rectangle<int>(0, 0, level.Width.Value * level.TileWidth.Value,
-            level.Height.Value * level.TileHeight.Value));
-
-        _currentLevel = level;
-
-        _scriptEngine.LoadAll(Path.Combine("Assets", "Scripts"));
-    }
-
-    public void ProcessFrame()
-    {
-        var currentTime = DateTimeOffset.Now;
-        var msSinceLastFrame = (currentTime - _lastUpdate).TotalMilliseconds;
-        _lastUpdate = currentTime;
-
-        if (_player == null)
-        {
-            return;
-        }
-
-        double up = _input.IsUpPressed() ? 1.0 : 0.0;
-        double down = _input.IsDownPressed() ? 1.0 : 0.0;
-        double left = _input.IsLeftPressed() ? 1.0 : 0.0;
-        double right = _input.IsRightPressed() ? 1.0 : 0.0;
-        bool isAttacking = _input.IsKeyAPressed() && (up + down + left + right <= 1);
-        bool addBomb = _input.IsKeyBPressed();
-
-        _player.UpdatePosition(up, down, left, right, 48, 48, msSinceLastFrame);
-        if (isAttacking)
-        {
-            _player.Attack();
-        }
-        
-        _scriptEngine.ExecuteAll(this);
-
-        if (addBomb)
-        {
-            AddBomb(_player.Position.X, _player.Position.Y, false);
-        }
-    }
-
-    public void RenderFrame()
-    {
-        _renderer.SetDrawColor(0, 0, 0, 255);
-        _renderer.ClearScreen();
-
-        var playerPosition = _player!.Position;
-        _renderer.CameraLookAt(playerPosition.X, playerPosition.Y);
-
-        RenderTerrain();
-        RenderAllObjects();
-
-        _renderer.PresentFrame();
-    }
-
-    public void RenderAllObjects()
-    {
-        var toRemove = new List<int>();
-        foreach (var gameObject in GetRenderables())
-        {
-            gameObject.Render(_renderer);
-            if (gameObject is TemporaryGameObject { IsExpired: true } tempGameObject)
-            {
-                toRemove.Add(tempGameObject.Id);
-            }
-        }
-
-        foreach (var id in toRemove)
-        {
-            _gameObjects.Remove(id, out var gameObject);
-
-            if (_player == null)
-            {
-                continue;
-            }
-
-            var tempGameObject = (TemporaryGameObject)gameObject!;
-            var deltaX = Math.Abs(_player.Position.X - tempGameObject.Position.X);
-            var deltaY = Math.Abs(_player.Position.Y - tempGameObject.Position.Y);
-            if (deltaX < 32 && deltaY < 32)
-            {
-                _player.GameOver();
-            }
-        }
-
-        _player?.Render(_renderer);
-    }
-
-    public void RenderTerrain()
-    {
-        foreach (var currentLayer in _currentLevel.Layers)
-        {
-            for (int i = 0; i < _currentLevel.Width; ++i)
-            {
-                for (int j = 0; j < _currentLevel.Height; ++j)
+                foreach (var tile in tileSet.Tiles)
                 {
-                    int? dataIndex = j * currentLayer.Width + i;
-                    if (dataIndex == null)
-                    {
+                    if (!tile.Id.HasValue || _tileIdMap.ContainsKey(tile.Id.Value))
                         continue;
-                    }
 
-                    var currentTileId = currentLayer.Data[dataIndex.Value] - 1;
-                    if (currentTileId == null)
-                    {
+                    tile.TextureId = _renderer.LoadTexture(
+                        Path.Combine("Assets", tile.Image), out _);
+                    _tileIdMap[tile.Id.Value] = tile;
+                }
+                _loadedTileSets[tileSet.Name] = tileSet;
+            }
+
+            int mapW = _currentLevel.Width .Value * _currentLevel.TileWidth .Value;
+            int mapH = _currentLevel.Height.Value * _currentLevel.TileHeight.Value;
+            _renderer.SetWorldBounds(new Rectangle<int>(0, 0, mapW, mapH));
+
+            _scriptEngine.LoadAll(Path.Combine("Assets","Scripts"));
+        }
+
+        public void ProcessFrame()
+        {
+            // restart on R
+            if (_isGameOver)
+            {
+                var elapsed = (DateTimeOffset.Now - _gameOverTimestamp).TotalSeconds;
+                if (elapsed >= 3.0 || _input.IsRestartPressed())
+                {
+                    Reset();
+                }
+                return;
+            }
+
+
+            var now = DateTimeOffset.Now;
+            var dt  = (now - _lastUpdate).TotalMilliseconds;
+            _lastUpdate = now;
+
+            if (_player == null || _isGameOver) return;
+
+            double up    = _input.IsUpPressed()    ? 1 : 0;
+            double down  = _input.IsDownPressed()  ? 1 : 0;
+            double left  = _input.IsLeftPressed()  ? 1 : 0;
+            double right = _input.IsRightPressed() ? 1 : 0;
+            bool attack  = _input.IsKeyAPressed() && (up+down+left+right <=1);
+
+            _player.UpdatePosition(up, down, left, right, 48, 48, dt);
+            if (attack) _player.Attack();
+
+            _scriptEngine.ExecuteAll(this);
+
+            if (_input.IsKeyBPressed())
+                AddBomb(_player.Position.X, _player.Position.Y, false);
+        }
+
+        public void RenderFrame()
+        {
+            _renderer.SetDrawColor(0,0,0,255);
+            _renderer.ClearScreen();
+
+            if (_player != null)
+                _renderer.CameraLookAt(_player.Position.X, _player.Position.Y);
+
+            RenderTerrain();
+            RenderObjects();
+
+            if (_isGameOver)
+            {
+                _renderer.ApplyDimEffect(0.7f);
+                var dims = _renderer.GetScreenDimensions();
+                int x = (dims.Width - _gameOverData.Width) / 2;
+                int y = (dims.Height - _gameOverData.Height) / 2;
+
+                var src = new Rectangle<int>(0,0,_gameOverData.Width, _gameOverData.Height);
+                var dst = new Rectangle<int>(x,y,_gameOverData.Width, _gameOverData.Height);
+                _renderer.RenderTextureScreenSpace(_gameOverTexId, src, dst);
+            }
+
+            _renderer.PresentFrame();
+        }
+
+        private void RenderTerrain()
+        {
+
+            int w = _currentLevel.Width .Value;
+            int h = _currentLevel.Height.Value;
+
+            foreach (var layer in _currentLevel.Layers)
+            {
+
+                int lw = layer.Width.Value;  
+
+                for (int i = 0; i < w; i++)
+                for (int j = 0; j < h; j++)
+                {
+
+                    int raw = layer.Data[j * lw + i].Value;
+                    if (raw == 0) 
                         continue;
-                    }
 
-                    var currentTile = _tileIdMap[currentTileId.Value];
+                    int tid = raw - 1;
+                    var tile = _tileIdMap[tid];
 
-                    var tileWidth = currentTile.ImageWidth ?? 0;
-                    var tileHeight = currentTile.ImageHeight ?? 0;
 
-                    var sourceRect = new Rectangle<int>(0, 0, tileWidth, tileHeight);
-                    var destRect = new Rectangle<int>(i * tileWidth, j * tileHeight, tileWidth, tileHeight);
-                    _renderer.RenderTexture(currentTile.TextureId, sourceRect, destRect);
+                    int tw = tile.ImageWidth .GetValueOrDefault();
+                    int th = tile.ImageHeight.GetValueOrDefault();
+
+                    var src = new Rectangle<int>(0, 0, tw, th);
+                    var dst = new Rectangle<int>(i * tw, j * th, tw, th);
+                    _renderer.RenderTexture(tile.TextureId, src, dst);
                 }
             }
         }
-    }
 
-    public IEnumerable<RenderableGameObject> GetRenderables()
-    {
-        foreach (var gameObject in _gameObjects.Values)
+
+        private void RenderObjects()
         {
-            if (gameObject is RenderableGameObject renderableGameObject)
+            var toRem = new List<int>();
+            foreach (var obj in GetRenderables())
             {
-                yield return renderableGameObject;
+                obj.Render(_renderer);
+                if(obj is TemporaryGameObject tmp && tmp.IsExpired)
+                    toRem.Add(tmp.Id);
             }
+
+            foreach (var id in toRem)
+            {
+                _gameObjects.Remove(id, out var removed);
+                if(!_isGameOver && _player != null && removed is TemporaryGameObject b)
+                {
+                    var dx = Math.Abs(_player.Position.X - b.Position.X);
+                    var dy = Math.Abs(_player.Position.Y - b.Position.Y);
+                    if (dx < 32 && dy < 32)
+                    {
+                        _player.GameOver();
+                        _isGameOver = true;
+                        _gameOverTimestamp = DateTimeOffset.Now;
+                    }
+                }
+            }
+
+            _player?.Render(_renderer);
         }
-    }
 
-    public (int X, int Y) GetPlayerPosition()
-    {
-        return _player!.Position;
-    }
+        public IEnumerable<RenderableGameObject> GetRenderables()
+            => _gameObjects.Values.OfType<RenderableGameObject>();
 
-    public void AddBomb(int X, int Y, bool translateCoordinates = true)
-    {
-        var worldCoords = translateCoordinates ? _renderer.ToWorldCoordinates(X, Y) : new Vector2D<int>(X, Y);
+        public (int X,int Y) GetPlayerPosition()
+            => _player!.Position;
 
-        SpriteSheet spriteSheet = SpriteSheet.Load(_renderer, "BombExploding.json", "Assets");
-        spriteSheet.ActivateAnimation("Explode");
+        public void AddBomb(int X,int Y,bool translate=true)
+        {
+            var world = translate
+                ? _renderer.ToWorldCoordinates(X,Y)
+                : new Vector2D<int>(X,Y);
 
-        TemporaryGameObject bomb = new(spriteSheet, 2.1, (worldCoords.X, worldCoords.Y));
-        _gameObjects.Add(bomb.Id, bomb);
+            var sheet = SpriteSheet.Load(_renderer,"BombExploding.json","Assets");
+            sheet.ActivateAnimation("Explode");
+
+            var bomb = new TemporaryGameObject(sheet,2.1,(world.X,world.Y));
+            _gameObjects[bomb.Id] = bomb;
+        }
+
+        private void Reset() => SetupWorld();
     }
 }

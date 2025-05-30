@@ -4,7 +4,7 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using TheAdventure.Models;
 using Point = Silk.NET.SDL.Point;
-
+using SilkRectangle = Silk.NET.Maths.Rectangle<int>;
 namespace TheAdventure;
 
 public unsafe class GameRenderer
@@ -21,10 +21,10 @@ public unsafe class GameRenderer
     public GameRenderer(Sdl sdl, GameWindow window)
     {
         _sdl = sdl;
-        
+
         _renderer = (Renderer*)window.CreateRenderer();
         _sdl.SetRenderDrawBlendMode(_renderer, BlendMode.Blend);
-        
+
         _window = window;
         var windowSize = window.Size;
         _camera = new Camera(windowSize.Width, windowSize.Height);
@@ -60,16 +60,16 @@ public unsafe class GameRenderer
                 {
                     throw new Exception("Failed to create surface from image data.");
                 }
-                
+
                 var imageTexture = _sdl.CreateTextureFromSurface(_renderer, imageSurface);
                 if (imageTexture == null)
                 {
                     _sdl.FreeSurface(imageSurface);
                     throw new Exception("Failed to create texture from surface.");
                 }
-                
+
                 _sdl.FreeSurface(imageSurface);
-                
+
                 _textureData[_textureId] = textureInfo;
                 _texturePointers[_textureId] = (IntPtr)imageTexture;
             }
@@ -109,5 +109,31 @@ public unsafe class GameRenderer
     public void PresentFrame()
     {
         _sdl.RenderPresent(_renderer);
+    }
+    
+    public (int Width, int Height) GetScreenDimensions()
+    => (_camera.Width, _camera.Height);
+
+    /// draws a semi-transparent black overlay over the entire screen.
+    public void ApplyDimEffect(float alpha)
+    {
+        var rect = new SilkRectangle(0, 0, _camera.Width, _camera.Height);
+        _sdl.SetRenderDrawBlendMode(_renderer, BlendMode.Blend);
+        _sdl.SetRenderDrawColor(_renderer, 0, 0, 0, (byte)(alpha * 255));
+        _sdl.RenderFillRect(_renderer, in rect);
+    }
+
+    /// renders a texture directly in screen space (ignores camera).
+    public void RenderTextureScreenSpace(int textureId, SilkRectangle src, SilkRectangle dst)
+    {
+        if (!_texturePointers.TryGetValue(textureId, out var ptr)) return;
+
+        int camX = _camera.X, camY = _camera.Y;
+
+        _camera.LookAt(0, 0);
+
+        _sdl.RenderCopy(_renderer, (Texture*)ptr, in src, in dst);
+
+        _camera.LookAt(camX, camY);
     }
 }
