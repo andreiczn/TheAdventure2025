@@ -1,5 +1,5 @@
 using Silk.NET.SDL;
-
+using System;
 namespace TheAdventure;
 
 public unsafe class GameWindow : IDisposable
@@ -74,5 +74,11 @@ public unsafe class GameWindow : IDisposable
     ~GameWindow()
     {
         ReleaseUnmanagedResources();
+    }
+
+     public void SetTitle(string title)
+    {
+            
+        _sdl.SetWindowTitle((Window*)_window, title);
     }
 }
